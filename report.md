@@ -1,159 +1,99 @@
-# Big Data Assignment 2 Report
+# Big Data Assignment 2 — Report
 
-## 1. Goal
+---
 
-The goal of this assignment was to build a small search engine for text documents in a Hadoop environment.
+## 1. Methodology
 
-The project follows these rules:
+### 1.1 System Overview
 
-- data preparation is done with PySpark
-- the cluster has a master node and a worker node
-- indexing is done with Hadoop MapReduce
-- the final index is stored in Cassandra
-- search results are ranked with BM25
+The goal of this assignment was to build a distributed search engine for plain text documents. The system takes a corpus of 100 documents, indexes them using Hadoop MapReduce, stores the resulting index in Cassandra, and answers free-text queries using BM25 ranking. The full pipeline runs inside Docker Compose and requires no manual setup steps beyond `docker compose up`.
 
-I did not use pandas or any other single-machine data processing library for the data pipeline.
+The pipeline uses distributed tools at every major stage: PySpark for data preparation and query execution, Hadoop MapReduce for index construction, and Cassandra as the storage and retrieval layer. No single-machine libraries such as pandas were used at any point.
 
-## 2. Cluster Setup
+---
 
-The system runs with Docker Compose.
+### 1.2 Cluster Architecture
 
-The container setup is:
+The cluster is defined with Docker Compose and consists of three containers:
 
-- `cluster-master`
-- `cluster-slave-1`
-- `cassandra-server`
+- **`cluster-master`** — orchestrates the full workflow: starts Hadoop services, prepares the data with PySpark, launches MapReduce jobs, loads data into Cassandra, and submits the search job to YARN.
+- **`cluster-slave-1`** — acts as the Hadoop worker node, running YARN NodeManager and HDFS DataNode. MapReduce tasks and YARN executors are scheduled here.
+- **`cassandra-server`** — stores the final inverted index and serves low-latency lookups during query time.
 
-The master container starts the whole workflow. It launches Hadoop services, prepares the data, builds the index, loads the index into Cassandra, and runs a sample search.
+Both `cluster-master` and `cluster-slave-1` use the same Docker image. This ensures that the Python runtime and all dependencies are identical on both nodes, which is important for YARN-distributed PySpark execution.
 
-The worker container is used by Hadoop YARN and HDFS as the slave node.
+---
 
-The Cassandra container stores the index tables.
+### 1.3 Data Preparation (`prepare_data.py`)
 
-The repo also uses one shared Docker image for the master and the worker. This keeps the Python runtime the same on both nodes.
+Data preparation is implemented as a PySpark job. The primary data source is a Parquet file at `/a.parquet` in HDFS, containing three columns: `id`, `title`, and `text`. If that file is not found, the pipeline falls back to bundled plain text files in `app/data`.
 
-## 3. Corpus
+PySpark reads the source, drops rows where `text` is null or empty, and samples exactly 100 documents. For each selected document, the script generates a local `.txt` file named in the format `<doc_id>_<doc_title>.txt`. These files are uploaded to HDFS under `/data/`, then read back with Spark and written to `/input/data` as a single-partition text file in tab-separated format:
 
-The corpus contains 100 text documents.
-
-The source data can come from:
-
-- `app/a.parquet` in HDFS, if it exists
-- the bundled fallback corpus in `app/data`
-
-The fallback corpus is a folder with many plain text files. Each file name contains the document id and the title.
-
-The project uses only 100 documents. This keeps the pipeline light enough for Docker Desktop and still satisfies the assignment size.
-
-## 4. Data Preparation
-
-Data preparation is implemented in [app/prepare_data.py](/Users/jeanne/code%20projects/BD_ass2_new/app/prepare_data.py).
-
-This step uses PySpark to:
-
-- read the source corpus
-- select the `id`, `title`, and `text` fields
-- remove empty rows
-- sample 100 documents
-
-The code path is:
-
-1. Read `/a.parquet` from HDFS if it is present.
-2. Otherwise reuse the bundled text corpus in `app/data`.
-3. Keep only rows where `text` is not null and not empty.
-4. Sample up to 100 documents.
-5. Write local `.txt` files for the chosen sample.
-6. Upload those files to HDFS under `/data`.
-7. Read `/data/*.txt` back with Spark and build one HDFS text file at `/input/data`.
-
-The final record format written to HDFS is:
-
-```text
+```
 doc_id<TAB>title<TAB>text
 ```
-
-The output in HDFS is a standard Hadoop text output directory:
-
-- `/input/data/_SUCCESS`
-- `/input/data/part-00000`
 
 This file is the input for the first MapReduce pipeline.
 
-## 5. MapReduce Pipeline 1
+**Design note:** this stage is a hybrid preprocessing step. PySpark is used for all reading, filtering, and sampling — no pandas or single-machine data processing libraries are involved. However, Spark runs in local mode here, and the driver writes local `.txt` files before uploading them to HDFS. This approach was chosen for simplicity and stability in the Docker environment and does not affect the correctness of the downstream distributed pipeline.
 
-Pipeline 1 is started by [app/create_index.sh](/Users/jeanne/code%20projects/BD_ass2_new/app/create_index.sh).
+---
 
-The input is `/input/data`, where each line is:
+### 1.4 Index Construction (`create_index.sh`)
 
-```text
-doc_id<TAB>title<TAB>text
+The index is built with two sequential MapReduce jobs.
+
+#### Pipeline 1 — Inverted Index (`mapper1.py` / `reducer1.py`)
+
+The mapper reads each line of `/input/data`, tokenizes the document text using alphanumeric tokens, and emits two types of records:
+
+- A **document metadata record** per document:
+  ```
+  __DOC__{doc_id}    DOC    {doc_id}    {title}    {doc_length}
+  ```
+  where `doc_length` is the total token count.
+
+- A **posting record** per distinct term:
+  ```
+  {term}    POSTING    {doc_id}    {tf}    {title}    {doc_length}
+  ```
+  where `tf` is term frequency within the document.
+
+The reducer groups records by key. For each term it emits one vocabulary row (`VOCAB    {term}    {df}`) and one posting row per matching document. Document metadata rows are passed through unchanged.
+
+After the MapReduce job completes, `create_index.sh` splits the output into three separate TSV files in HDFS:
+
+| HDFS path | Content |
+|---|---|
+| `/indexer/postings` | `term, doc_id, tf, title, doc_length` |
+| `/indexer/vocabulary` | `term, df` |
+| `/indexer/documents` | `doc_id, title, doc_length` |
+
+#### Pipeline 2 — Corpus Statistics (`mapper2.py` / `reducer2.py`)
+
+The second job reads the `DOC` records produced by Pipeline 1. Each document contributes `1` to the document count and its `doc_length` to the total token count. The reducer computes:
+
+- `N` — total number of documents
+- `AVGDL` — average document length in tokens
+
+Results are stored at `/indexer/stats` in the format:
+```
+STAT    N       100
+STAT    AVGDL   <value computed from the indexed corpus>
 ```
 
-The first mapper reads one document and emits term-level records. The key point is:
+These values are required by the BM25 scoring formula.
 
-- the term is the key for posting data
-- the mapper also keeps document metadata for later steps
+---
 
-The reducer groups the records by term and produces three logical outputs:
+### 1.5 Cassandra Storage (`app.py`, `store_index.sh`)
 
-- postings
-- vocabulary
-- document stats
+Once the HDFS index is ready, all four datasets are loaded into Cassandra under the keyspace `search_engine` (SimpleStrategy, replication factor 1). The loader script truncates all tables on each run and reloads them from HDFS, which makes the pipeline idempotent.
 
-The output formats are:
-
-```text
-postings: term<TAB>doc_id<TAB>tf<TAB>title<TAB>doc_length
-vocabulary: term<TAB>df
-documents: doc_id<TAB>title<TAB>doc_length
-```
-
-Where:
-
-- `tf` = term frequency in one document
-- `df` = document frequency in the whole corpus
-- `doc_length` = token count for one document
-
-The pipeline writes the HDFS folders:
-
-- `/indexer/postings`
-- `/indexer/vocabulary`
-- `/indexer/documents`
-
-## 6. MapReduce Pipeline 2
-
-Pipeline 2 computes corpus-level statistics.
-
-It reads the document stats from pipeline 1 and calculates:
-
-- total document count `N`
-- average document length `AVGDL`
-
-The output format is:
-
-```text
-STAT<TAB>N<TAB>value
-STAT<TAB>AVGDL<TAB>value
-```
-
-These values are stored in HDFS under:
-
-- `/indexer/stats`
-
-They are needed by the BM25 scoring formula.
-
-## 7. Cassandra Schema
-
-The Cassandra keyspace is `search_engine`.
-
-The schema is created in [app/app.py](/Users/jeanne/code%20projects/BD_ass2_new/app/app.py).
-
-Tables and data types:
+The schema is as follows:
 
 ```sql
-CREATE KEYSPACE IF NOT EXISTS search_engine
-WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
-
 CREATE TABLE documents (
     doc_id text PRIMARY KEY,
     title text,
@@ -180,121 +120,135 @@ CREATE TABLE corpus_stats (
 );
 ```
 
-Example logical rows:
+The `postings` table uses a composite primary key `(term, doc_id)`, which allows Cassandra to efficiently retrieve all documents containing a given term — exactly the access pattern needed at query time.
+
+Example rows from a sample run:
 
 - `documents`: `("10174562", "A History of Money and Banking in the United States", 1234)`
 - `vocabulary`: `("money", 58)`
 - `postings`: `("money", "10174562", 4, "A History of Money and Banking in the United States", 1234)`
-- `corpus_stats`: `("AVGDL", 842.61)`
+- `corpus_stats`: `("AVGDL", 842.61)` *(example value from one run)*
 
-The loader script truncates these tables on each run and reloads them from HDFS.
+---
 
-## 8. BM25 Search
+### 1.6 BM25 Search (`query.py`, `search.sh`)
 
-The search logic is implemented in [app/query.py](/Users/jeanne/code%20projects/BD_ass2_new/app/query.py).
+Search queries are executed by a PySpark job submitted to YARN in client mode. The job connects to Cassandra, retrieves the relevant index data, and ranks documents using the BM25 formula.
 
-The BM25 parameters are:
-
+**BM25 parameters** (defined in `engine_utils.py`):
 - `k1 = 1.2`
 - `b = 0.75`
 
-The scoring formula used in [app/engine_utils.py](/Users/jeanne/code%20projects/BD_ass2_new/app/engine_utils.py) is:
+**Scoring formula** for each (term, document) pair:
 
-```text
-idf = log(N / df)
+```
+idf  = log(N / df)
 norm = k1 * ((1 - b) + b * (doc_length / AVGDL))
-score = idf * ((tf * (k1 + 1)) / (tf + norm))
+score = idf * (tf * (k1 + 1)) / (tf + norm)
 ```
 
-The query flow is:
+**Query flow:**
 
-1. Read the query text from command line arguments.
-2. Tokenize the text with a simple alphanumeric regex.
-3. Load `N` and `AVGDL` from `corpus_stats`.
-4. For each query term, read `df` from `vocabulary`.
-5. Read all matching postings from `postings`.
-6. Calculate a BM25 score for each matching document-term pair.
-7. Sum scores for the same document.
-8. Sort the results.
-9. Print the top 10 documents as `doc_id<TAB>title`.
+1. The query string is taken from the command line.
+2. It is tokenized with the regex `[A-Za-z0-9]+` and lowercased.
+3. The app connects to `cassandra-server` and reads `N` and `AVGDL` from `corpus_stats`.
+4. For each query term, `df` is looked up in `vocabulary` and all matching rows are fetched from `postings`.
+5. Each row becomes a tuple `(doc_id, title, tf, doc_length, df)`, loaded into a Spark RDD.
+6. BM25 scores are computed in parallel; `reduceByKey` sums scores across terms for each document.
+7. `takeOrdered(10, key=lambda x: -x[2])` returns the top 10 results.
+8. Results are printed as `doc_id<TAB>title`.
 
-The final search is run by [app/search.sh](/Users/jeanne/code%20projects/BD_ass2_new/app/search.sh).
+The `search.sh` script submits the job to YARN in client mode:
 
-It uses:
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode client \
+  --driver-memory 512m \
+  --executor-memory 512m \
+  --py-files /app/engine_utils.py \
+  query.py "$@"
+```
 
-- `--master yarn`
-- `--deploy-mode client`
-- `--driver-memory 512m`
-- `--executor-memory 512m`
+Client mode was chosen over cluster mode because it keeps the driver on the master node, which simplifies log access and makes the pipeline easier to monitor and grade in this Docker environment. The executors still run on the YARN cluster, so the execution remains distributed.
 
-The job runs successfully in YARN client mode and prints 10 ranked documents.
+---
 
-## 9. Technical Choices
+## 2. Demonstration
 
-I made a few choices to keep the project stable:
+### 2.1 How to Run
 
-- I used exactly 100 documents.
-- I used PySpark for preparation and search.
-- I used Hadoop MapReduce for indexing.
-- I used Cassandra for the final index.
-- I used one shared Docker image for both Hadoop nodes.
-- I moved Hadoop XML settings into mounted config files.
-- I used one Spark archive in HDFS instead of many jar files, because it is more stable for YARN localization in Docker.
-
-These choices do not change the assignment idea. They only make the environment easier to run and easier to grade.
-
-## 10. Validation
-
-I tested the project from a clean clone with:
+Make sure Docker Desktop is running. Clone the repository and start the full pipeline with:
 
 ```bash
 docker compose up --build
 ```
 
-The full run completes with:
+The master container will automatically run every step in sequence:
 
-- data preparation
-- MapReduce indexing
-- Cassandra loading
-- BM25 search
+1. Start Hadoop and Cassandra services
+2. Prepare 100 documents and upload them to HDFS
+3. Build the inverted index with two MapReduce jobs
+4. Load the index into Cassandra
+5. Execute sample BM25 search queries and print results
 
-The final log ends with:
+No manual steps are required. The pipeline finishes when you see:
 
-- `Job 0 finished: takeOrdered ...`
-- `SparkContext is stopping with exitCode 0.`
-- `cluster-master exited with code 0`
+```
+SparkContext is stopping with exitCode 0.
+cluster-master exited with code 0
+```
 
-This shows that the complete pipeline works from start to finish.
+To run a custom query after the pipeline has finished:
 
-## 11. Screenshots
+```bash
+docker exec cluster-master bash /app/search.sh "your query here"
+```
 
-### 11.1 Indexing
+---
 
-Insert a screenshot that shows:
+### 2.2 Screenshot 1 — Successful Indexing of 100 Documents
 
-- `Prepared HDFS paths:`
-- `Found 100 items`
-- `Index created in HDFS:`
-- `Index data loaded into Cassandra keyspace search_engine.`
+![alt text](<Снимок экрана 2026-03-31 в 19.33.56.png>)
+The screenshot shows the log lines confirming that all indexing stages completed successfully, including `Prepared HDFS paths`, `Found 100 items`, `Index created in HDFS`, and `Index data loaded into Cassandra keyspace search_engine`.
 
-### 11.2 Search
+---
 
-Insert a screenshot that shows:
+### 2.3 Screenshot 2 — Search Query 1 - "history money banking"
+![alt text](<Снимок экрана 2026-04-03 в 17.14.15.png>)
 
-- `Searching for documents using BM25`
-- `Job 0 finished: takeOrdered ...`
-- 10 result lines
-- `SparkContext is stopping with exitCode 0.`
+---
 
-## 12. Conclusion
+### 2.4 Screenshot 3 — Search Query 2 - "sherlock holmes"
 
-The project is a working mini search engine for 100 documents.
+![alt text](<Снимок экрана 2026-04-03 в 17.15.14.png>)
 
-It uses:
+---
 
-- PySpark for data preparation
-- Hadoop MapReduce for indexing
-- Cassandra for storage
-- BM25 for ranking
+### 2.5 Screenshot 4 — Search Query 3 - "crime drama film"
 
-The final result is a reproducible Docker Compose project that starts from one command and finishes successfully.
+![alt text](<Снимок экрана 2026-04-03 в 17.22.00.png>)
+---
+
+### 2.6 Reflections on Results
+
+The BM25 ranking behaves as expected across all tested queries. Documents containing multiple query terms with high term frequency rank at the top, while documents with only partial overlap appear lower in the list.
+
+The `idf` component of the formula means that terms appearing in many of the 100 documents contribute less to the final score, while rare and specific terms have stronger discriminative power. This is visible in practice: a query like `"money banking"` returns documents specifically about finance and economics rather than general articles that happen to mention these words once.
+
+The `b = 0.75` length normalization ensures that longer documents are not unfairly rewarded for simply containing more tokens. With an average document length of several hundred tokens across the corpus, this normalization has a noticeable effect on ranking order.
+
+One limitation of the current setup is the small corpus size. With only 100 documents, some queries return fewer than 10 strongly relevant results, so the lower-ranked entries may have only marginal term overlap with the query. A larger corpus would produce sharper distinctions between relevant and non-relevant documents and make the BM25 scores more meaningful.
+
+---
+
+## 3. Conclusion
+
+The assignment is complete. The project implements a full distributed search pipeline:
+
+- **Data preparation** with PySpark, reading from a Parquet corpus and writing to HDFS
+- **Inverted index construction** with two Hadoop MapReduce jobs, producing postings, vocabulary, document metadata, and corpus statistics
+- **Index storage** in Cassandra, with a schema designed around the access patterns of BM25 retrieval
+- **Query execution** with PySpark on YARN, using BM25 ranking to return the top 10 documents per query
+
+The system starts with `docker compose up` and requires no manual steps. The output is reproducible and confirmed across a clean clone and full Docker run.
