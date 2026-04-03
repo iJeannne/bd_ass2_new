@@ -8,7 +8,7 @@
 
 The goal of this assignment was to build a distributed search engine for plain text documents. The system takes a corpus of 100 documents, indexes them using Hadoop MapReduce, stores the resulting index in Cassandra, and answers free-text queries using BM25 ranking. The full pipeline runs inside Docker Compose and requires no manual setup steps beyond `docker compose up`.
 
-The pipeline uses distributed tools at every major stage: PySpark for data preparation and query execution, Hadoop MapReduce for index construction, and Cassandra as the storage and retrieval layer. No single-machine libraries such as pandas were used at any point.
+The pipeline uses distributed tools at every major stage: PySpark for data preparation and query execution, Hadoop MapReduce for index construction, and Cassandra as the storage and retrieval layer. No single-machine libraries such as pandas were used at any point. Data preparation includes a local driver-based staging step before uploading to HDFS; all subsequent stages — indexing, storage, and search — run fully distributed on the cluster.
 
 ---
 
@@ -244,8 +244,7 @@ One limitation of the current setup is the small corpus size. With only 100 docu
 
 ## 3. Conclusion
 
-The assignment is complete. The project implements a full distributed search pipeline:
-
+The assignment is complete. The project implements a mostly distributed search pipeline, with a local driver-based staging step in data preparation and fully distributed execution for all subsequent stages:
 - **Data preparation** with PySpark, reading from a Parquet corpus and writing to HDFS
 - **Inverted index construction** with two Hadoop MapReduce jobs, producing postings, vocabulary, document metadata, and corpus statistics
 - **Index storage** in Cassandra, with a schema designed around the access patterns of BM25 retrieval
